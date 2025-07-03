@@ -12,8 +12,8 @@ import (
 const (
 	Host                           = "localhost"
 	Port                           = 4223
-	DistanceIRV2BrickletUID        = "XXX"
-	IndustrialDualRelayBrickletUID = "XXX"
+	DistanceIRV2BrickletUID        = "YZ2"
+	IndustrialDualRelayBrickletUID = "2bFm"
 )
 
 type Client struct {

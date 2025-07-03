@@ -10,8 +10,8 @@ type HotkeyConfig struct {
 }
 
 type TinkerforgeClient interface {
-	Up()
-	Down()
+	Up() uint64
+	Down() uint64
 }
 
 func GetHotkeyConfig(client TinkerforgeClient) []HotkeyConfig {
@@ -19,13 +19,13 @@ func GetHotkeyConfig(client TinkerforgeClient) []HotkeyConfig {
 		{
 			Modifiers: []hotkey.Modifier{hotkey.ModShift, hotkey.ModCmd},
 			Key:       hotkey.KeyF11,
-			Action:    client.Up,
+			Action:    func() { client.Up() },
 			Desc:      "Up",
 		},
 		{
 			Modifiers: []hotkey.Modifier{hotkey.ModShift, hotkey.ModCmd},
 			Key:       hotkey.KeyF12,
-			Action:    client.Down,
+			Action:    func() { client.Down() },
 			Desc:      "Down",
 		},
 	}
