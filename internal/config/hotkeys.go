@@ -1,6 +1,9 @@
 package config
 
-import "golang.design/x/hotkey"
+import (
+	"github.com/knivram/upndown/internal/tinkerforge"
+	"golang.design/x/hotkey"
+)
 
 type HotkeyConfig struct {
 	Modifiers []hotkey.Modifier
@@ -10,8 +13,7 @@ type HotkeyConfig struct {
 }
 
 type TinkerforgeClient interface {
-	Up() uint64
-	Down() uint64
+	GoTo(position uint16) uint64
 }
 
 func GetHotkeyConfig(client TinkerforgeClient) []HotkeyConfig {
@@ -19,13 +21,13 @@ func GetHotkeyConfig(client TinkerforgeClient) []HotkeyConfig {
 		{
 			Modifiers: []hotkey.Modifier{hotkey.ModShift, hotkey.ModCmd},
 			Key:       hotkey.KeyF11,
-			Action:    func() { client.Up() },
+			Action:    func() { client.GoTo(tinkerforge.PositionUp) },
 			Desc:      "Up",
 		},
 		{
 			Modifiers: []hotkey.Modifier{hotkey.ModShift, hotkey.ModCmd},
 			Key:       hotkey.KeyF12,
-			Action:    func() { client.Down() },
+			Action:    func() { client.GoTo(tinkerforge.PositionDown) },
 			Desc:      "Down",
 		},
 	}
