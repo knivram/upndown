@@ -1,8 +1,10 @@
 package tinkerforge
 
 import (
+	"context"
 	"fmt"
 	"log"
+	"sync"
 
 	"github.com/Tinkerforge/go-api-bindings/distance_ir_v2_bricklet"
 	"github.com/Tinkerforge/go-api-bindings/industrial_dual_relay_bricklet"
@@ -20,6 +22,9 @@ type Client struct {
 	ipcon               *ipconnection.IPConnection
 	distanceIR          *distance_ir_v2_bricklet.DistanceIRV2Bricklet
 	industrialDualRelay *industrial_dual_relay_bricklet.IndustrialDualRelayBricklet
+	mu                  sync.Mutex
+	cancelFunc          context.CancelFunc
+	activeCallbackID    uint64
 }
 
 func NewClient() *Client {
@@ -47,4 +52,26 @@ func (c *Client) Disconnect() {
 	if c.ipcon != nil {
 		c.ipcon.Disconnect()
 	}
+}
+
+// Stop cancels any ongoing movement and stops the relays
+func (c *Client) Stop() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Cancel any ongoing operation
+	if c.cancelFunc != nil {
+		c.cancelFunc()
+		c.cancelFunc = nil
+	}
+
+	// Deregister active callback if any
+	if c.activeCallbackID != 0 {
+		c.distanceIR.DeregisterDistanceCallback(c.activeCallbackID)
+		c.activeCallbackID = 0
+	}
+
+	// Stop both relays (true, true means both are off/stopped)
+	c.industrialDualRelay.SetValue(true, true)
+	log.Println("Movement stopped")
 }
