@@ -9,6 +9,6 @@ BINARY="upndown"
 mkdir -p "$INSTALL_DIR"
 go build -o "$PROJECT_DIR/$BINARY" "$PROJECT_DIR/cmd/upndown/main.go"
 cp "$PROJECT_DIR/$BINARY" "$INSTALL_DIR/$BINARY"
-launchctl kickstart -k "gui/$(id -u)/com.knivram.upndown"
+launchctl kickstart -k "gui/$(id -u)/me.knivram.upndown"
 
 echo "Deployed and restarted $BINARY"
