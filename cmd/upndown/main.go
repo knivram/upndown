@@ -1,9 +1,10 @@
 package main
 
 import (
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/knivram/upndown/internal/config"
@@ -26,28 +27,22 @@ func NewApp() *App {
 }
 
 func (a *App) Run() {
-	err := a.tinkerforgeClient.Connect()
-	if err != nil {
-		log.Fatalf("Failed to connect to Tinkerforge daemon: %v", err)
+	if err := a.tinkerforgeClient.Connect(); err != nil {
+		slog.Error("failed to connect to Tinkerforge daemon", "err", err)
+		os.Exit(1)
 	}
 	defer a.tinkerforgeClient.Disconnect()
 
 	hotkeys := config.GetHotkeyConfig(a.tinkerforgeClient)
-
 	for _, hk := range hotkeys {
-		err := a.hotkeyManager.RegisterHotkey(hk.Modifiers, hk.Key, hk.Action)
-		if err != nil {
-			log.Printf("Failed to register hotkey for %s: %v", hk.Desc, err)
+		if err := a.hotkeyManager.RegisterHotkey(hk.Modifiers, hk.Key, hk.Action); err != nil {
+			slog.Error("failed to register hotkey", "desc", hk.Desc, "err", err)
 		} else {
-			log.Printf("✓ %s: %v", hk.Desc, xhotkey.New(hk.Modifiers, hk.Key))
+			slog.Info("hotkey registered", "desc", hk.Desc, "keys", xhotkey.New(hk.Modifiers, hk.Key).String())
 		}
 	}
 
-	log.Println("Application started. Press hotkeys to trigger actions.")
-	log.Println("Available hotkeys:")
-	for _, hk := range hotkeys {
-		log.Printf("  %v - %s", xhotkey.New(hk.Modifiers, hk.Key), hk.Desc)
-	}
+	slog.Info("application started; waiting for hotkeys")
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -57,14 +52,33 @@ func (a *App) Run() {
 }
 
 func (a *App) Shutdown() {
-	log.Println("Shutting down application...")
+	slog.Info("shutting down")
 	a.hotkeyManager.Shutdown()
 	a.tinkerforgeClient.Disconnect()
-	log.Println("Application shutdown complete")
+	slog.Info("shutdown complete")
+}
+
+// setupLogging installs a structured slog logger writing to stderr (which
+// launchd redirects to ~/Library/Logs/upndown.log). The level is controlled by
+// UPNDOWN_LOG_LEVEL (debug|info|warn|error); default is info. Set it to debug
+// to see per-target queueing and listener registration.
+func setupLogging() {
+	level := slog.LevelInfo
+	switch strings.ToLower(os.Getenv("UPNDOWN_LOG_LEVEL")) {
+	case "debug":
+		level = slog.LevelDebug
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
 }
 
 func main() {
-	// On macOS, hotkey events must be handled on the main thread
+	setupLogging()
+
+	// On macOS, hotkey events must be handled on the main thread.
 	mainthread.Init(func() {
 		app := NewApp()
 		app.Run()

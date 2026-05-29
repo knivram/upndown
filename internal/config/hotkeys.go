@@ -13,7 +13,7 @@ type HotkeyConfig struct {
 }
 
 type TinkerforgeClient interface {
-	GoTo(position uint16) uint64
+	GoTo(position uint16)
 }
 
 func GetHotkeyConfig(client TinkerforgeClient) []HotkeyConfig {

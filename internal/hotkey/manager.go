@@ -2,7 +2,7 @@ package hotkey
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 
 	"golang.design/x/hotkey"
 )
@@ -12,8 +12,7 @@ func (m *Manager) RegisterHotkey(modifiers []hotkey.Modifier, key hotkey.Key, ac
 	defer m.mu.Unlock()
 
 	hk := hotkey.New(modifiers, key)
-	err := hk.Register()
-	if err != nil {
+	if err := hk.Register(); err != nil {
 		return fmt.Errorf("failed to register hotkey %v: %w", hk, err)
 	}
 
@@ -25,7 +24,7 @@ func (m *Manager) RegisterHotkey(modifiers []hotkey.Modifier, key hotkey.Key, ac
 		for {
 			select {
 			case <-hk.Keydown():
-				log.Printf("Hotkey triggered: %v", hk)
+				slog.Info("hotkey triggered", "keys", hk.String())
 				action()
 			case <-m.ctx.Done():
 				return
@@ -33,7 +32,7 @@ func (m *Manager) RegisterHotkey(modifiers []hotkey.Modifier, key hotkey.Key, ac
 		}
 	}()
 
-	log.Printf("Registered hotkey: %v", hk)
+	slog.Debug("hotkey listener registered", "keys", hk.String())
 	return nil
 }
 
@@ -43,7 +42,7 @@ func (m *Manager) UnregisterAllHotkeys() {
 
 	for _, hk := range m.hotkeys {
 		hk.Unregister()
-		log.Printf("Unregistered hotkey: %v", hk)
+		slog.Debug("hotkey unregistered", "keys", hk.String())
 	}
 	m.hotkeys = m.hotkeys[:0]
 }
