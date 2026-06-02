@@ -3,8 +3,6 @@ package tinkerforge
 import (
 	"log/slog"
 	"time"
-
-	"github.com/Tinkerforge/go-api-bindings/distance_ir_v2_bricklet"
 )
 
 const (
@@ -13,19 +11,30 @@ const (
 	PositionUp   = 1095
 	PositionDown = 670
 
-	// callbackPeriodMs is how often (in ms) the sensor firmware evaluates the
-	// stop threshold while a move is in progress. Small enough to stop promptly,
-	// large enough not to flood the connection. Streaming is fully off when idle.
-	callbackPeriodMs = 25
-
-	// maxMoveDuration force-stops the relay if a move never reaches its target,
-	// preventing a runaway motor.
-	maxMoveDuration = 30 * time.Second
-
 	// positionTolerance is the deadband (mm) around a target within which the
 	// platform is considered "already there", so a press toward a target you are
 	// already at does nothing instead of making a tiny corrective move. Tunable.
 	positionTolerance = 10
+
+	// Move-watchdog defaults, copied into Client fields by NewClient so tests can
+	// override them. They must satisfy
+	//   pollInterval < requestTimeout < sensorStaleTimeout < maxMoveDuration
+	// (asserted by TestWatchdogConstantsAreOrdered).
+	//
+	// defaultPollInterval is how often the worker polls GetDistance while moving:
+	// small enough to stop promptly, large enough to leave the socket idle between
+	// polls so a stop command is not queued behind a poll.
+	defaultPollInterval = 50 * time.Millisecond
+	// defaultSensorStaleTimeout force-stops a move if no fresh reading arrives for
+	// this long (= 3 × requestTimeout, so a couple of transient timeouts do not
+	// abort a healthy move, but a genuinely dead sensor never runs the platform
+	// blind). This is the fast safety path.
+	defaultSensorStaleTimeout = 1500 * time.Millisecond
+	// defaultMaxMoveDuration force-stops a move that never reaches its target
+	// (mechanical fault, unreachable target). Tighter than the old 30s — a normal
+	// full-travel move takes ~10s, so 15s is a real backstop rather than a value
+	// looser than a normal move.
+	defaultMaxMoveDuration = 15 * time.Second
 )
 
 type direction int
@@ -44,13 +53,39 @@ func (d direction) String() string {
 
 // Relay wiring: channel0/channel1 map to the motor contactors. Both true is the
 // stopped (safe) state. These values must match the physical wiring.
+//
+// SetValue on the Industrial Dual Relay is configured response-not-expected in
+// the bindings: it is fire-and-forget, so relayStop never blocks and (barring an
+// encode/connection error) never reports failure. A nil return therefore means
+// "the stop command was queued", not "the motor is confirmed off" — the safety
+// guarantee comes from the worker deciding to stop promptly (polling + watchdog),
+// not from confirming the relay. Do not "helpfully" add a retry: there is no ack
+// to retry on, and TCP already delivers the queued command.
 func (c *Client) relayUp() error   { return c.relay.SetValue(false, true) }
 func (c *Client) relayDown() error { return c.relay.SetValue(true, false) }
 func (c *Client) relayStop() error { return c.relay.SetValue(true, true) }
 
+// forceStop drives the relay to the safe state and logs if the (rare) error path
+// fires. It is the single stop used by every move-ending path.
+func (c *Client) forceStop() {
+	if err := c.relayStop(); err != nil {
+		slog.Error("failed to stop relay", "err", err)
+	}
+}
+
+// reachedTarget reports whether reading d has reached target for the given
+// direction. Up moves increase the distance reading, down moves decrease it.
+func reachedTarget(dir direction, d, target uint16) bool {
+	if dir == directionUp {
+		return d >= target
+	}
+	return d <= target
+}
+
 // startMove begins moving toward target. It runs only on the worker goroutine
 // and only when no move is in progress. It returns true when a move was actually
-// started (relay engaged and stop callback armed).
+// started (relay engaged). The single GetDistance here is the only blocking call
+// on the idle path; a press queued during it waits at most one requestTimeout.
 func (c *Client) startMove(target uint16) bool {
 	current, err := c.sensor.GetDistance()
 	if err != nil {
@@ -62,10 +97,11 @@ func (c *Client) startMove(target uint16) bool {
 		slog.Info("already at target; nothing to do", "position", current, "target", target)
 		return false
 	}
-	if current < target {
-		return c.beginMove(current, target, directionUp)
+	dir := directionUp
+	if current > target {
+		dir = directionDown
 	}
-	return c.beginMove(current, target, directionDown)
+	return c.beginMove(current, target, dir)
 }
 
 // absDiff returns |a-b| without underflowing uint16.
@@ -76,30 +112,14 @@ func absDiff(a, b uint16) uint16 {
 	return b - a
 }
 
-// beginMove arms the stop callback first, then engages the relay, so that a
-// failure to configure the sensor never leaves the motor running.
+// beginMove engages the relay and records the move so the worker's poll loop can
+// watch it. It does no sensor I/O — stop detection is done by polling. The move
+// state (including moveStart, which seeds the watchdog clock) is recorded before
+// the relay engages, so it is fixed the moment the platform can begin to move.
 func (c *Client) beginMove(current, target uint16, dir direction) bool {
-	// Stream changed distance samples while moving and decide in code (below)
-	// when the target is reached. The firmware "smaller-than" threshold proved
-	// unreliable for downward moves — it let the platform run past the target —
-	// so we compare here instead. Streaming is turned off again as soon as we stop.
-	if err := c.sensor.SetDistanceCallbackConfiguration(callbackPeriodMs, true, distance_ir_v2_bricklet.ThresholdOptionOff, 0, 0); err != nil {
-		slog.Error("failed to configure distance callback; aborting move", "err", err)
-		return false
-	}
-
-	c.moveEpoch++
-	epoch := c.moveEpoch
-	c.activeCallbackID = c.sensor.RegisterDistanceCallback(func(d uint16) {
-		// Defensive: the firmware threshold should already guarantee this, but
-		// re-check so a stray callback can never stop the move early.
-		if (dir == directionUp && d >= target) || (dir == directionDown && d <= target) {
-			select {
-			case c.reached <- reachEvent{epoch: epoch, at: d}:
-			default: // a signal is already pending; one is enough
-			}
-		}
-	})
+	c.moveDir = dir
+	c.moveTarget = target
+	c.moveStart = c.now()
 
 	var relayErr error
 	if dir == directionUp {
@@ -110,61 +130,74 @@ func (c *Client) beginMove(current, target uint16, dir direction) bool {
 	if relayErr != nil {
 		slog.Error("failed to engage relay; aborting move", "dir", dir.String(), "err", relayErr)
 		_ = c.relayStop()
-		c.disarmCallback()
 		return false
 	}
 
 	c.moving = true
-	slog.Info("move started", "from", current, "to", target, "dir", dir.String(), "cb", c.activeCallbackID)
+	slog.Info("move started", "from", current, "to", target, "dir", dir.String())
 	return true
 }
 
-// finishMove handles a target-crossing for the current move.
-func (c *Client) finishMove(ev reachEvent) {
-	if !c.moving || ev.epoch != c.moveEpoch {
-		return // leftover signal from a finished or preempted move
-	}
-	c.teardown()
-	slog.Info("move complete", "position", ev.at)
+// moveAction is the outcome of a single poll of an in-progress move.
+type moveAction int
+
+const (
+	moveContinue moveAction = iota
+	moveReached
+	moveStale
+	moveTimedOut
+)
+
+// pollResult carries a poll outcome plus the data the worker needs to log it.
+type pollResult struct {
+	action  moveAction
+	at      uint16        // last reading (valid for moveReached / good moveContinue)
+	elapsed time.Duration // move duration (timeout) or time since last good read (stale)
+	readErr error         // non-nil when this poll's GetDistance failed
 }
 
-// abortMove stops a move that overran the safety timeout.
-func (c *Client) abortMove() {
-	if !c.moving {
-		return
+// checkProgress performs one poll of an in-progress move and decides what to do.
+// It is called only by the worker. It updates *lastGood on a successful read so
+// the staleness watchdog measures the gap since the last *good* reading.
+// Durations are evaluated against c.now() (the injected clock), which makes the
+// watchdog deterministic in tests.
+func (c *Client) checkProgress(moveStart time.Time, lastGood *time.Time) pollResult {
+	now := c.now()
+	if elapsed := now.Sub(moveStart); elapsed >= c.maxMoveDuration {
+		return pollResult{action: moveTimedOut, elapsed: elapsed}
 	}
-	c.teardown()
-	slog.Warn("move aborted by safety timeout; relay force-stopped", "after", maxMoveDuration)
+	d, err := c.sensor.GetDistance()
+	if err != nil {
+		if stale := now.Sub(*lastGood); stale >= c.sensorStaleTimeout {
+			return pollResult{action: moveStale, elapsed: stale, readErr: err}
+		}
+		return pollResult{action: moveContinue, readErr: err} // transient; lastGood unchanged
+	}
+	*lastGood = now
+	if reachedTarget(c.moveDir, d, c.moveTarget) {
+		return pollResult{action: moveReached, at: d}
+	}
+	return pollResult{action: moveContinue, at: d}
 }
 
-// stopMove cancels an in-progress move. It is a no-op when nothing is moving.
-func (c *Client) stopMove(reason string) {
-	if !c.moving {
-		return
-	}
-	c.teardown()
-	slog.Info("move stopped", "reason", reason)
-}
-
-// teardown stops the motor and tears down the active move's callback/state.
-func (c *Client) teardown() {
-	if err := c.relayStop(); err != nil {
-		slog.Error("failed to stop relay", "err", err)
-	}
-	c.disarmCallback()
+// finishMove ends a move that reached its target.
+func (c *Client) finishMove(at uint16) {
+	c.forceStop()
 	c.moving = false
+	slog.Info("move complete", "position", at, "target", c.moveTarget)
 }
 
-// disarmCallback turns sensor streaming off, deregisters the active callback,
-// and clears any pending reach signal.
-func (c *Client) disarmCallback() {
-	if err := c.sensor.SetDistanceCallbackConfiguration(0, false, distance_ir_v2_bricklet.ThresholdOptionOff, 0, 0); err != nil {
-		slog.Error("failed to disable distance callback", "err", err)
-	}
-	c.sensor.DeregisterDistanceCallback(c.activeCallbackID)
-	select { // drop any stale reach signal
-	case <-c.reached:
-	default:
-	}
-	c.activeCallbackID = 0
+// abortMove force-stops a move that the watchdog ended (sensor went stale or the
+// max duration elapsed). reason distinguishes the two production faults.
+func (c *Client) abortMove(reason string, after time.Duration) {
+	c.forceStop()
+	c.moving = false
+	slog.Warn("move aborted; relay force-stopped", "reason", reason, "after", after, "target", c.moveTarget)
+}
+
+// stopMove ends an in-progress move on request (button press or shutdown).
+func (c *Client) stopMove(reason string) {
+	c.forceStop()
+	c.moving = false
+	slog.Info("move stopped", "reason", reason)
 }

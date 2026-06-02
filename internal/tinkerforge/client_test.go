@@ -1,12 +1,14 @@
 package tinkerforge
 
 import (
+	"bytes"
 	"errors"
+	"log/slog"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/Tinkerforge/go-api-bindings/distance_ir_v2_bricklet"
 )
 
 // --- fakes -----------------------------------------------------------------
@@ -17,12 +19,14 @@ type fakeRelay struct {
 	c1    bool
 	calls int
 	err   error
-	// stopped is signalled every time the relay enters the stop state (true,true).
+	// stopped is signalled every time the relay enters the stop state (true,true);
+	// engaged every time it enters a move state (channels differ).
 	stopped chan struct{}
+	engaged chan struct{}
 }
 
 func newFakeRelay() *fakeRelay {
-	return &fakeRelay{stopped: make(chan struct{}, 16)}
+	return &fakeRelay{stopped: make(chan struct{}, 16), engaged: make(chan struct{}, 16)}
 }
 
 func (r *fakeRelay) SetValue(c0, c1 bool) error {
@@ -33,9 +37,15 @@ func (r *fakeRelay) SetValue(c0, c1 bool) error {
 	}
 	r.c0, r.c1 = c0, c1
 	r.calls++
-	if c0 && c1 {
+	switch {
+	case c0 && c1:
 		select {
 		case r.stopped <- struct{}{}:
+		default:
+		}
+	case c0 != c1:
+		select {
+		case r.engaged <- struct{}{}:
 		default:
 		}
 	}
@@ -54,111 +64,114 @@ func (r *fakeRelay) callCount() int {
 	return r.calls
 }
 
-type fakeSensor struct {
-	mu sync.Mutex
-
-	distance uint16
-	distErr  error
-
-	cb   func(uint16)
-	cbID uint64
-	next uint64
-
-	lastPeriod       uint32
-	lastValueChanged bool
-	lastOption       distance_ir_v2_bricklet.ThresholdOption
-	lastMin          uint16
-	configCalls      int
-
-	deregistered  uint64
-	deregisterCnt int
-	registered    chan struct{} // signalled when a callback is registered
+// reading is one scripted GetDistance result.
+type reading struct {
+	d   uint16
+	err error
 }
 
-func newFakeSensor(distance uint16) *fakeSensor {
-	return &fakeSensor{distance: distance, registered: make(chan struct{}, 8)}
+func ok(d uint16) reading { return reading{d: d} }
+func fail() reading       { return reading{err: errors.New("request timed out")} }
+
+// fakeSensor returns a scripted sequence of readings; the last entry repeats once
+// the sequence is exhausted (so "moving but never reaching" / "errors forever"
+// are expressed by ending on that reading). The worker is the only reader; the
+// sequence is set before run() starts and not mutated afterwards.
+type fakeSensor struct {
+	mu  sync.Mutex
+	seq []reading
+	i   int
+}
+
+func newFakeSensor(seq ...reading) *fakeSensor {
+	if len(seq) == 0 {
+		seq = []reading{ok(0)}
+	}
+	return &fakeSensor{seq: seq}
 }
 
 func (s *fakeSensor) GetDistance() (uint16, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.distance, s.distErr
+	r := s.seq[min(s.i, len(s.seq)-1)]
+	s.i++
+	return r.d, r.err
 }
 
-func (s *fakeSensor) SetDistanceCallbackConfiguration(period uint32, valueHasToChange bool, option distance_ir_v2_bricklet.ThresholdOption, min uint16, _ uint16) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.lastPeriod = period
-	s.lastValueChanged = valueHasToChange
-	s.lastOption = option
-	s.lastMin = min
-	s.configCalls++
-	return nil
+// fakeClock is an atomic-backed clock so a test goroutine can advance it while
+// the worker goroutine reads it without tripping the race detector.
+type fakeClock struct {
+	ns atomic.Int64
 }
 
-func (s *fakeSensor) RegisterDistanceCallback(fn func(uint16)) uint64 {
-	s.mu.Lock()
-	s.next++
-	s.cb = fn
-	s.cbID = s.next
-	id := s.next
-	s.mu.Unlock()
-	select {
-	case s.registered <- struct{}{}:
-	default:
-	}
-	return id
-}
+func newFakeClock() *fakeClock { return &fakeClock{} }
 
-func (s *fakeSensor) DeregisterDistanceCallback(id uint64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.deregistered = id
-	s.deregisterCnt++
-	if id == s.cbID {
-		s.cb = nil
-	}
-}
-
-// fire simulates the sensor firmware invoking the registered callback.
-func (s *fakeSensor) fire(d uint16) {
-	s.mu.Lock()
-	cb := s.cb
-	s.mu.Unlock()
-	if cb != nil {
-		cb(d)
-	}
-}
+func (c *fakeClock) now() time.Time          { return time.Unix(0, c.ns.Load()) }
+func (c *fakeClock) advance(d time.Duration) { c.ns.Add(int64(d)) }
 
 func newTestClient(s distanceSensor, r relayController) *Client {
 	return &Client{
-		sensor:  s,
-		relay:   r,
-		cmd:     make(chan uint16, commandQueueSize),
-		reached: make(chan reachEvent, 1),
-		done:    make(chan struct{}),
+		sensor:             s,
+		relay:              r,
+		cmd:                make(chan uint16, commandQueueSize),
+		done:               make(chan struct{}),
+		now:                time.Now,
+		pollInterval:       time.Millisecond, // poll fast so worker tests finish quickly
+		sensorStaleTimeout: defaultSensorStaleTimeout,
+		maxMoveDuration:    defaultMaxMoveDuration,
 	}
 }
 
-// --- startMove: direction, deadband, streaming config ----------------------
+// --- constants -------------------------------------------------------------
+
+func TestWatchdogConstantsAreOrdered(t *testing.T) {
+	// The whole stop story depends on this ordering; pin it so a future tweak
+	// can't silently break it. requestTimeout is the same const Connect() passes
+	// to ipcon.SetTimeout, so this guards the real production value.
+	if !(defaultPollInterval < requestTimeout &&
+		requestTimeout < defaultSensorStaleTimeout &&
+		defaultSensorStaleTimeout < defaultMaxMoveDuration) {
+		t.Fatalf("watchdog constants out of order: poll=%v req=%v stale=%v max=%v",
+			defaultPollInterval, requestTimeout, defaultSensorStaleTimeout, defaultMaxMoveDuration)
+	}
+}
+
+// --- reachedTarget ---------------------------------------------------------
+
+func TestReachedTarget(t *testing.T) {
+	cases := []struct {
+		dir    direction
+		d      uint16
+		target uint16
+		want   bool
+	}{
+		{directionUp, 1094, 1095, false},
+		{directionUp, 1095, 1095, true},
+		{directionUp, 1100, 1095, true},
+		{directionDown, 671, 670, false},
+		{directionDown, 670, 670, true},
+		{directionDown, 665, 670, true},
+	}
+	for _, tc := range cases {
+		if got := reachedTarget(tc.dir, tc.d, tc.target); got != tc.want {
+			t.Errorf("reachedTarget(%v, %d, %d) = %v, want %v", tc.dir, tc.d, tc.target, got, tc.want)
+		}
+	}
+}
+
+// --- startMove: direction and deadband -------------------------------------
 
 func TestStartMoveUp(t *testing.T) {
-	s := newFakeSensor(1000)
-	r := newFakeRelay()
-	c := newTestClient(s, r)
+	c := newTestClient(newFakeSensor(ok(1000)), newFakeRelay())
 
 	if !c.startMove(1095) {
 		t.Fatal("expected a move to start")
 	}
-	if c0, c1 := r.value(); c0 || !c1 {
+	if c0, c1 := c.relay.(*fakeRelay).value(); c0 || !c1 {
 		t.Errorf("relay = (%v,%v), want up (false,true)", c0, c1)
 	}
-	// Stop detection is done in code, so the sensor just streams changed samples.
-	if s.lastOption != distance_ir_v2_bricklet.ThresholdOptionOff || !s.lastValueChanged {
-		t.Errorf("want streaming config (Off, valueHasToChange=true); got option=%q changed=%v", s.lastOption, s.lastValueChanged)
-	}
-	if s.lastPeriod != callbackPeriodMs {
-		t.Errorf("callback period = %d, want %d", s.lastPeriod, callbackPeriodMs)
+	if c.moveDir != directionUp || c.moveTarget != 1095 {
+		t.Errorf("move = (%v,%d), want (up,1095)", c.moveDir, c.moveTarget)
 	}
 	if !c.moving {
 		t.Error("moving = false, want true")
@@ -166,15 +179,16 @@ func TestStartMoveUp(t *testing.T) {
 }
 
 func TestStartMoveDown(t *testing.T) {
-	s := newFakeSensor(1000)
-	r := newFakeRelay()
-	c := newTestClient(s, r)
+	c := newTestClient(newFakeSensor(ok(1000)), newFakeRelay())
 
 	if !c.startMove(670) {
 		t.Fatal("expected a move to start")
 	}
-	if c0, c1 := r.value(); !c0 || c1 {
+	if c0, c1 := c.relay.(*fakeRelay).value(); !c0 || c1 {
 		t.Errorf("relay = (%v,%v), want down (true,false)", c0, c1)
+	}
+	if c.moveDir != directionDown {
+		t.Errorf("dir = %v, want down", c.moveDir)
 	}
 	if !c.moving {
 		t.Error("moving = false, want true")
@@ -183,9 +197,8 @@ func TestStartMoveDown(t *testing.T) {
 
 func TestStartMoveWithinToleranceDoesNothing(t *testing.T) {
 	// 1090 is within positionTolerance (10) of target 1095 -> no move.
-	s := newFakeSensor(1090)
 	r := newFakeRelay()
-	c := newTestClient(s, r)
+	c := newTestClient(newFakeSensor(ok(1090)), r)
 
 	if c.startMove(1095) {
 		t.Error("expected no move when within the deadband")
@@ -200,23 +213,19 @@ func TestStartMoveWithinToleranceDoesNothing(t *testing.T) {
 
 func TestStartMoveJustOutsideToleranceMoves(t *testing.T) {
 	// 1080 is 15mm from target 1095, outside the 10mm deadband -> moves up.
-	s := newFakeSensor(1080)
-	r := newFakeRelay()
-	c := newTestClient(s, r)
+	c := newTestClient(newFakeSensor(ok(1080)), newFakeRelay())
 
 	if !c.startMove(1095) {
 		t.Fatal("expected a move just outside the deadband")
 	}
-	if c0, c1 := r.value(); c0 || !c1 {
+	if c0, c1 := c.relay.(*fakeRelay).value(); c0 || !c1 {
 		t.Errorf("relay = (%v,%v), want up (false,true)", c0, c1)
 	}
 }
 
 func TestStartMoveSensorError(t *testing.T) {
-	s := newFakeSensor(0)
-	s.distErr = errors.New("request timed out")
 	r := newFakeRelay()
-	c := newTestClient(s, r)
+	c := newTestClient(newFakeSensor(fail()), r)
 
 	if c.startMove(1095) {
 		t.Error("expected no move when the sensor read fails")
@@ -229,97 +238,139 @@ func TestStartMoveSensorError(t *testing.T) {
 	}
 }
 
-// --- stop detection (in code) ----------------------------------------------
+// --- checkProgress: the poll decision (deterministic, no goroutine) --------
 
-func TestCallbackSignalsWhenUpReachesTarget(t *testing.T) {
-	s := newFakeSensor(1000)
+// movingClient returns an idle test client wired to the given sensor with a
+// fake clock, then puts it into the moving-up-toward-target state as if a move
+// had just started at the clock's current time.
+func movingClient(s distanceSensor, dir direction, target uint16) (*Client, *fakeClock, time.Time, *time.Time) {
+	clk := newFakeClock()
 	c := newTestClient(s, newFakeRelay())
-	c.startMove(1095) // up: stop once distance >= 1095
+	c.now = clk.now
+	c.moving = true
+	c.moveDir = dir
+	c.moveTarget = target
+	start := clk.now()
+	lastGood := start
+	return c, clk, start, &lastGood
+}
 
-	s.fire(1090) // not there yet
-	select {
-	case <-c.reached:
-		t.Fatal("signalled before reaching the target")
-	default:
-	}
-
-	s.fire(1100) // crossed
-	select {
-	case ev := <-c.reached:
-		if ev.at != 1100 {
-			t.Errorf("reach position = %d, want 1100", ev.at)
-		}
-	default:
-		t.Fatal("did not signal after crossing the target")
+func TestCheckProgressReachedUp(t *testing.T) {
+	c, _, start, lastGood := movingClient(newFakeSensor(ok(1100)), directionUp, 1095)
+	res := c.checkProgress(start, lastGood)
+	if res.action != moveReached || res.at != 1100 {
+		t.Fatalf("got action=%v at=%d, want reached@1100", res.action, res.at)
 	}
 }
 
-func TestCallbackSignalsWhenDownReachesTarget(t *testing.T) {
-	s := newFakeSensor(700)
-	c := newTestClient(s, newFakeRelay())
-	c.startMove(670) // down: stop once distance <= 670
-
-	s.fire(680) // not there yet
-	select {
-	case <-c.reached:
-		t.Fatal("signalled before reaching the target")
-	default:
-	}
-
-	s.fire(665) // crossed
-	select {
-	case ev := <-c.reached:
-		if ev.at != 665 {
-			t.Errorf("reach position = %d, want 665", ev.at)
-		}
-	default:
-		t.Fatal("did not signal after crossing the target (the downward-move regression)")
+func TestCheckProgressReachedDown(t *testing.T) {
+	// The downward-move regression: must stop once distance <= target.
+	c, _, start, lastGood := movingClient(newFakeSensor(ok(665)), directionDown, 670)
+	res := c.checkProgress(start, lastGood)
+	if res.action != moveReached || res.at != 665 {
+		t.Fatalf("got action=%v at=%d, want reached@665", res.action, res.at)
 	}
 }
 
-func TestFinishMoveStopsEverything(t *testing.T) {
-	s := newFakeSensor(1000)
+func TestCheckProgressContinuesAndAdvancesLastGood(t *testing.T) {
+	c, clk, start, lastGood := movingClient(newFakeSensor(ok(800)), directionUp, 1095)
+	clk.advance(123 * time.Millisecond)
+	res := c.checkProgress(start, lastGood)
+	if res.action != moveContinue {
+		t.Fatalf("action = %v, want continue", res.action)
+	}
+	if !lastGood.Equal(clk.now()) {
+		t.Errorf("lastGood = %v, want advanced to %v on a good read", *lastGood, clk.now())
+	}
+}
+
+func TestCheckProgressTransientErrorContinuesWithoutAdvancingLastGood(t *testing.T) {
+	c, clk, start, lastGood := movingClient(newFakeSensor(fail()), directionUp, 1095)
+	before := *lastGood
+	clk.advance(c.sensorStaleTimeout - time.Millisecond) // not stale yet
+	res := c.checkProgress(start, lastGood)
+	if res.action != moveContinue {
+		t.Fatalf("action = %v, want continue (transient error)", res.action)
+	}
+	if res.readErr == nil {
+		t.Error("readErr = nil, want the transient error reported")
+	}
+	if !lastGood.Equal(before) {
+		t.Error("lastGood advanced on a failed read; it must only advance on success")
+	}
+}
+
+func TestCheckProgressStaleSensorAborts(t *testing.T) {
+	c, clk, start, lastGood := movingClient(newFakeSensor(fail()), directionUp, 1095)
+	clk.advance(c.sensorStaleTimeout) // no good reading for the whole window
+	res := c.checkProgress(start, lastGood)
+	if res.action != moveStale {
+		t.Fatalf("action = %v, want stale", res.action)
+	}
+	if res.elapsed < c.sensorStaleTimeout {
+		t.Errorf("elapsed = %v, want >= %v", res.elapsed, c.sensorStaleTimeout)
+	}
+}
+
+func TestCheckProgressMaxDurationAborts(t *testing.T) {
+	// Good readings that never reach the target; max duration must still stop it.
+	c, clk, start, lastGood := movingClient(newFakeSensor(ok(800)), directionUp, 1095)
+	clk.advance(c.maxMoveDuration)
+	res := c.checkProgress(start, lastGood)
+	if res.action != moveTimedOut {
+		t.Fatalf("action = %v, want timed out", res.action)
+	}
+}
+
+// --- move-ending methods: relay + logging ----------------------------------
+
+func TestFinishMoveStopsRelay(t *testing.T) {
 	r := newFakeRelay()
-	c := newTestClient(s, r)
+	c := newTestClient(newFakeSensor(ok(1000)), r)
+	c.moving = true
+	c.moveTarget = 1095
 
-	c.startMove(1095)
-	cbID := c.activeCallbackID
-	c.finishMove(reachEvent{epoch: c.moveEpoch, at: 1100})
+	c.finishMove(1100)
 
 	if c0, c1 := r.value(); !c0 || !c1 {
 		t.Errorf("relay = (%v,%v), want stopped (true,true)", c0, c1)
-	}
-	if s.lastPeriod != 0 || s.lastOption != distance_ir_v2_bricklet.ThresholdOptionOff {
-		t.Errorf("streaming not disabled: period=%d option=%q", s.lastPeriod, s.lastOption)
-	}
-	if s.deregisterCnt == 0 || s.deregistered != cbID {
-		t.Errorf("callback %d not deregistered (last=%d, count=%d)", cbID, s.deregistered, s.deregisterCnt)
 	}
 	if c.moving {
 		t.Error("moving = true, want false")
 	}
 }
 
-func TestFinishMoveIgnoresStaleEpoch(t *testing.T) {
-	s := newFakeSensor(1000)
-	r := newFakeRelay()
-	c := newTestClient(s, r)
+func TestAbortMoveLogsDistinctReasons(t *testing.T) {
+	for _, reason := range []string{"sensor_stale", "max_duration"} {
+		var buf bytes.Buffer
+		prev := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
 
-	c.startMove(1095)
-	c.finishMove(reachEvent{epoch: c.moveEpoch - 1, at: 1100}) // stale
+		r := newFakeRelay()
+		c := newTestClient(newFakeSensor(ok(1000)), r)
+		c.moving = true
+		c.moveTarget = 670
+		c.abortMove(reason, 1500*time.Millisecond)
 
-	if !c.moving {
-		t.Error("a stale-epoch signal ended the current move")
-	}
-	if c0, c1 := r.value(); c0 || !c1 {
-		t.Errorf("relay = (%v,%v), want still up (false,true)", c0, c1)
+		slog.SetDefault(prev)
+
+		if c0, c1 := r.value(); !c0 || !c1 {
+			t.Errorf("[%s] relay = (%v,%v), want stopped (true,true)", reason, c0, c1)
+		}
+		out := buf.String()
+		if !strings.Contains(out, "reason="+reason) {
+			t.Errorf("[%s] log missing reason: %s", reason, out)
+		}
+		if !strings.Contains(out, "target=670") {
+			t.Errorf("[%s] log missing target: %s", reason, out)
+		}
 	}
 }
 
 // --- GoTo handoff ----------------------------------------------------------
 
 func TestGoToQueuesPressesInOrder(t *testing.T) {
-	c := newTestClient(newFakeSensor(1000), newFakeRelay())
+	c := newTestClient(newFakeSensor(ok(1000)), newFakeRelay())
 
 	c.GoTo(100)
 	c.GoTo(200)
@@ -333,7 +384,7 @@ func TestGoToQueuesPressesInOrder(t *testing.T) {
 }
 
 func TestGoToDoesNotBlockWhenFull(t *testing.T) {
-	c := newTestClient(newFakeSensor(1000), newFakeRelay())
+	c := newTestClient(newFakeSensor(ok(1000)), newFakeRelay())
 	// Fill the queue and push one extra; GoTo must not block (test would hang).
 	for i := 0; i < commandQueueSize+2; i++ {
 		c.GoTo(uint16(i))
@@ -346,7 +397,8 @@ func TestGoToDoesNotBlockWhenFull(t *testing.T) {
 // --- worker (goroutine) behaviour ------------------------------------------
 
 func TestWorkerAutoStopsAtTarget(t *testing.T) {
-	s := newFakeSensor(1000)
+	// First reading picks direction (up: 1000 < 1095); later polls reach 1100.
+	s := newFakeSensor(ok(1000), ok(1090), ok(1100))
 	r := newFakeRelay()
 	c := newTestClient(s, r)
 
@@ -354,14 +406,13 @@ func TestWorkerAutoStopsAtTarget(t *testing.T) {
 	go c.run()
 	defer func() { close(c.done); c.wg.Wait() }()
 
-	c.GoTo(1095) // up
+	c.GoTo(1095)
 	select {
-	case <-s.registered:
+	case <-r.engaged:
 	case <-time.After(time.Second):
 		t.Fatal("worker did not start the move")
 	}
 
-	s.fire(1100) // reach the target on its own
 	select {
 	case <-r.stopped:
 	case <-time.After(time.Second):
@@ -370,7 +421,8 @@ func TestWorkerAutoStopsAtTarget(t *testing.T) {
 }
 
 func TestWorkerPressWhileMovingStopsWithoutRestarting(t *testing.T) {
-	s := newFakeSensor(1000)
+	// Direction read 1000 (>670 -> down), then 800 forever: never reaches target.
+	s := newFakeSensor(ok(1000), ok(800))
 	r := newFakeRelay()
 	c := newTestClient(s, r)
 
@@ -380,7 +432,7 @@ func TestWorkerPressWhileMovingStopsWithoutRestarting(t *testing.T) {
 
 	c.GoTo(670) // start moving down
 	select {
-	case <-s.registered:
+	case <-r.engaged:
 	case <-time.After(time.Second):
 		t.Fatal("worker did not start the move")
 	}
@@ -392,10 +444,38 @@ func TestWorkerPressWhileMovingStopsWithoutRestarting(t *testing.T) {
 		t.Fatal("relay was not stopped by the press")
 	}
 
-	// No new move may be started by that press.
+	// No new move may be engaged by that press.
 	select {
-	case <-s.registered:
+	case <-r.engaged:
 		t.Fatal("a press while moving started a new move instead of just stopping")
-	case <-time.After(200 * time.Millisecond):
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestWorkerForceStopsOnStaleSensor(t *testing.T) {
+	// Direction read succeeds (1000 > 670 -> down); every poll after that fails.
+	s := newFakeSensor(ok(1000), fail())
+	r := newFakeRelay()
+	clk := newFakeClock()
+	c := newTestClient(s, r)
+	c.now = clk.now
+
+	c.wg.Add(1)
+	go c.run()
+	defer func() { close(c.done); c.wg.Wait() }()
+
+	c.GoTo(670)
+	select {
+	case <-r.engaged:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not start the move")
+	}
+
+	// Sensor is now unresponsive; advancing past the stale window must force-stop.
+	clk.advance(c.sensorStaleTimeout + time.Second)
+	select {
+	case <-r.stopped:
+	case <-time.After(time.Second):
+		t.Fatal("relay was not force-stopped after the sensor went stale")
 	}
 }

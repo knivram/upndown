@@ -19,10 +19,14 @@ const (
 	IndustrialDualRelayBrickletUID = "2bFm"
 
 	// requestTimeout bounds how long a blocking getter (e.g. GetDistance) waits
-	// for the daemon before failing. The binding default is 2.5s; a shorter
-	// timeout lets the movement worker recover quickly from a sensor hiccup
-	// instead of stalling. Getters normally answer in well under 50ms.
-	requestTimeout = 1 * time.Second
+	// for the daemon before failing. Getters normally answer in well under 50ms;
+	// 500ms cuts off a genuine daemon hang quickly without false-tripping on a
+	// slow-but-alive read. It also bounds the worst-case stop latency: the worker
+	// can only be blocked inside a single GetDistance poll, so a button press
+	// waits at most one requestTimeout before the worker can act on it. The
+	// invariant requestTimeout < sensorStaleTimeout (asserted in a test) ensures
+	// one transient timeout never force-stops a healthy move.
+	requestTimeout = 500 * time.Millisecond
 
 	// commandQueueSize bounds how many button presses can be buffered while the
 	// worker is briefly busy. Presses beyond this are dropped (logged) rather
@@ -30,26 +34,17 @@ const (
 	commandQueueSize = 4
 )
 
-// distanceSensor and relayController are the slices of the Tinkerforge bricklet
-// APIs this package actually uses. Depending on interfaces (rather than the
-// concrete bricklet types) keeps the movement logic unit-testable with fakes.
+// distanceSensor is the slice of the Distance IR v2 bricklet API this package
+// uses. Stop detection is done by actively polling GetDistance from the worker
+// (a pull model), so the daemon pushing streamed samples is no longer on the
+// critical path; only GetDistance is needed. Depending on an interface (rather
+// than the concrete bricklet) keeps the movement logic unit-testable with fakes.
 type distanceSensor interface {
 	GetDistance() (uint16, error)
-	SetDistanceCallbackConfiguration(period uint32, valueHasToChange bool, option distance_ir_v2_bricklet.ThresholdOption, min uint16, max uint16) error
-	RegisterDistanceCallback(func(uint16)) uint64
-	DeregisterDistanceCallback(uint64)
 }
 
 type relayController interface {
 	SetValue(channel0 bool, channel1 bool) error
-}
-
-// reachEvent is sent by the distance callback when the configured target has
-// been crossed. epoch identifies the move it belongs to so the worker can
-// ignore signals left over from an already-finished or preempted move.
-type reachEvent struct {
-	epoch uint64
-	at    uint16
 }
 
 type Client struct {
@@ -57,17 +52,27 @@ type Client struct {
 	sensor distanceSensor
 	relay  relayController
 
-	cmd      chan uint16     // button presses; buffered FIFO, processed by run()
-	reached  chan reachEvent // target-crossed signal from the sensor callback
-	done     chan struct{}   // closed to stop the worker
+	cmd      chan uint16   // button presses; buffered FIFO, processed by run()
+	done     chan struct{} // closed to stop the worker
 	wg       sync.WaitGroup
 	stopOnce sync.Once
 
+	// now is the clock used for the move watchdog. It is set once before run()
+	// starts and is time.Now in production; tests inject a fake clock so the
+	// staleness / max-duration logic is deterministic.
+	now func() time.Time
+
+	// Move tuning. Defaulted from the consts in NewClient; tests override them.
+	pollInterval       time.Duration
+	sensorStaleTimeout time.Duration
+	maxMoveDuration    time.Duration
+
 	// The fields below are owned exclusively by the run() goroutine and must
 	// not be touched from anywhere else, so they need no locking.
-	moving           bool
-	activeCallbackID uint64
-	moveEpoch        uint64
+	moving     bool
+	moveDir    direction
+	moveTarget uint16
+	moveStart  time.Time // when the current move engaged the relay
 }
 
 func NewClient() *Client {
@@ -83,12 +88,15 @@ func NewClient() *Client {
 		os.Exit(1)
 	}
 	return &Client{
-		ipcon:   &ipcon,
-		sensor:  &distanceIR,
-		relay:   &dualRelay,
-		cmd:     make(chan uint16, commandQueueSize),
-		reached: make(chan reachEvent, 1),
-		done:    make(chan struct{}),
+		ipcon:              &ipcon,
+		sensor:             &distanceIR,
+		relay:              &dualRelay,
+		cmd:                make(chan uint16, commandQueueSize),
+		done:               make(chan struct{}),
+		now:                time.Now,
+		pollInterval:       defaultPollInterval,
+		sensorStaleTimeout: defaultSensorStaleTimeout,
+		maxMoveDuration:    defaultMaxMoveDuration,
 	}
 }
 
@@ -138,39 +146,82 @@ func (c *Client) GoTo(target uint16) {
 
 // run is the single owner of all hardware I/O. Everything that talks to the
 // bricklets happens here, so a slow or timing-out call can never block the
-// hotkey handlers.
+// hotkey handlers for longer than one requestTimeout.
+//
+// A move is watched by actively polling the sensor on a ticker (see
+// checkProgress); the ticker only fires while a move is in progress and is torn
+// down on every move-ending path. There are no asynchronous hardware callbacks,
+// so no move state needs epoch-tagging or locking.
 func (c *Client) run() {
 	defer c.wg.Done()
 
-	// safety fires if a move never reaches its target (e.g. mechanical fault),
-	// forcing the relay off. It is nil while idle, so that case never selects.
-	var safety <-chan time.Time
+	var (
+		poll          *time.Ticker
+		pollC         <-chan time.Time // nil while idle, so that case never selects
+		lastGood      time.Time        // time of the last good reading of the current move
+		readErrStreak bool
+	)
+	// stopPolling tears down the move ticker. It is idempotent and is called on
+	// every path that clears c.moving.
+	stopPolling := func() {
+		if poll != nil {
+			poll.Stop()
+			poll = nil
+		}
+		pollC = nil
+		readErrStreak = false
+	}
 
 	for {
 		select {
 		case <-c.done:
-			c.stopMove("shutdown")
-			if err := c.relayStop(); err != nil {
-				slog.Error("failed to stop relay on shutdown", "err", err)
+			stopPolling()
+			if c.moving {
+				c.stopMove("shutdown")
+			} else {
+				c.forceStop() // leave the relay in the known-safe state
 			}
 			return
+
 		case target := <-c.cmd:
 			switch {
 			case c.moving:
 				// A press while moving means "stop here" — do not start a new move.
-				c.stopMove("stopped by button press")
-				safety = nil
+				c.stopMove("button press")
+				stopPolling()
 			case c.startMove(target):
-				safety = time.After(maxMoveDuration)
-			default:
-				safety = nil
+				// A move only ever starts from idle, so poll is nil here.
+				// beginMove already recorded c.moveStart; seed the staleness
+				// clock from it so the watchdog measures from the move's start.
+				lastGood = c.moveStart
+				readErrStreak = false
+				poll = time.NewTicker(c.pollInterval)
+				pollC = poll.C
 			}
-		case ev := <-c.reached:
-			c.finishMove(ev)
-			safety = nil
-		case <-safety:
-			c.abortMove()
-			safety = nil
+
+		case <-pollC:
+			res := c.checkProgress(c.moveStart, &lastGood)
+			if res.readErr != nil {
+				if !readErrStreak {
+					slog.Debug("distance read failed during move; will force-stop if it persists", "err", res.readErr)
+					readErrStreak = true
+				}
+			} else {
+				readErrStreak = false
+			}
+			switch res.action {
+			case moveReached:
+				c.finishMove(res.at)
+				stopPolling()
+			case moveStale:
+				c.abortMove("sensor_stale", res.elapsed)
+				stopPolling()
+			case moveTimedOut:
+				c.abortMove("max_duration", res.elapsed)
+				stopPolling()
+			case moveContinue:
+				// keep moving
+			}
 		}
 	}
 }
