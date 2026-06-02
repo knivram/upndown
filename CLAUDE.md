@@ -48,20 +48,41 @@ A button press is a **toggle**, decided by the worker:
 - **moving** → stop the platform where it is (this applies to *either* button, same or
   opposite direction) and do **not** start a new move; pressing again starts a fresh move.
 
-A move also stops on its own when it reaches the target. Stop detection is done **in code**:
-during a move the sensor streams changed distance samples (`SetDistanceCallbackConfiguration`
-with `ThresholdOptionOff`, `valueHasToChange=true`) and the callback compares the reading to
-the target. (The firmware `Smaller`/`Greater` thresholds were tried first but the `<`
-threshold did not fire reliably for downward moves, letting the platform run past the
-target.) Streaming is turned fully off when idle. A `positionTolerance` deadband makes a
-press toward a target you are already at a no-op. A move that never reaches its target is
-force-stopped after `maxMoveDuration` (runaway guard); the relay is set to a known-safe
-state on connect and stopped on shutdown.
+A move also stops on its own when it reaches the target. Stop detection is done by
+**actively polling** the sensor (a *pull* model): while a move is in progress the worker
+reads `GetDistance` every `pollInterval` (50ms) and compares it to the target in code
+(`checkProgress` → `reachedTarget`; up stops at `d >= target`, down at `d <= target`).
+Polling replaced an earlier *push* model (`SetDistanceCallbackConfiguration` streaming +
+a registered callback): when the daemon stopped pushing samples the platform ran blind to
+the physical limit. Pulling does not depend on the daemon volunteering data and yields an
+explicit error when the daemon is unresponsive. (The firmware `Smaller`/`Greater`
+thresholds were also tried and abandoned — the `<` threshold did not fire reliably for
+downward moves.)
 
-Movement state (`moving`, `activeCallbackID`, `moveEpoch`) is owned exclusively by the
-worker goroutine and needs no locking; the sensor callback only does a non-blocking send
-of a `reachEvent` tagged with the move's epoch, so signals from a finished or superseded
-move are ignored.
+Two watchdogs protect against a move that never reaches its target:
+- **sensor-stale** (`sensorStaleTimeout`, 1.5s = 3× `requestTimeout`): if no *good* reading
+  arrives for this long, the move is force-stopped — so a dead/unresponsive sensor never
+  runs the platform blind. A couple of isolated `GetDistance` timeouts are tolerated
+  without aborting.
+- **max-duration** (`maxMoveDuration`, 15s): a hard backstop. A normal full-travel move
+  takes ~10s, so 15s is genuinely tighter than a real move (the old 30s was looser than a
+  normal move and so was no backstop at all).
+
+A `positionTolerance` deadband makes a press toward a target you are already at a no-op.
+The relay is set to a known-safe state on connect and stopped on shutdown.
+
+Because all hardware I/O is synchronous and runs on the worker, the worker can be blocked
+inside a single `GetDistance` poll for up to `requestTimeout` (500ms); a button press
+therefore takes at most ~one `requestTimeout` to be acted on. Relay `SetValue` is
+**fire-and-forget** in the bindings (response-not-expected), so `relayStop()` never blocks
+and a `nil` return means "stop command queued", not "motor confirmed off" — the safety
+guarantee comes from the worker deciding to stop promptly, not from confirming the relay.
+
+Movement state (`moving`, `moveDir`, `moveTarget`, `moveStart`) is owned exclusively by the
+worker goroutine and needs no locking. There are no asynchronous hardware callbacks, so no
+move state needs epoch-tagging. The poll ticker is created when a move starts and torn down
+on every move-ending path. The move-watchdog clock is injected (`Client.now`, default
+`time.Now`) so the staleness / max-duration logic is unit-testable without real time.
 
 ## Hardware Integration
 
@@ -83,7 +104,12 @@ stop = `(true, true)`. These values must match the physical wiring.
 Uses the stdlib `log/slog` text handler writing to stderr. Under launchd, stdout/stderr are
 redirected to `~/Library/Logs/upndown.log`. The level is controlled by the
 `UPNDOWN_LOG_LEVEL` env var (`debug|info|warn|error`, default `info`); `debug` adds
-per-target queueing and listener registration lines.
+button-press queueing lines and the first failed distance read of a stale streak.
+
+A move ends with one of: `move complete` (reached target), `move stopped` (button press or
+shutdown, with `reason`), or `move aborted` (a watchdog fired, with `reason=sensor_stale`
+or `reason=max_duration`). The two abort reasons distinguish the two production faults — a
+flaky/dead sensor vs. a move that simply never reaches the target.
 
 ## Platform Requirements
 
