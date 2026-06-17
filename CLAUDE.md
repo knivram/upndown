@@ -96,8 +96,16 @@ reported by the sensor; a *larger* reading means the platform is *higher*):
 - PositionUp: 1095mm
 - PositionDown: 670mm
 
-Relay wiring (`SetValue(channel0, channel1)`): up = `(false, true)`, down = `(true, false)`,
-stop = `(true, true)`. These values must match the physical wiring.
+Relay wiring (`SetValue(channel0, channel1)`): channel0 = Up line, channel1 = Down line,
+each over COM↔NO. up = `(true, false)`, down = `(false, true)`, stop = `(false, false)`.
+These values must match the physical wiring.
+
+Stop is the de-energized state, so it is fail-safe: when the bricklet loses power (e.g. the
+Mac sleeping and dropping USB power) both channels drop to `(false, false)` = stop. An
+earlier wiring had stop = `(true, true)` (desk lines on the NC terminals), so a power cycle
+asserted *both* buttons at once — an invalid input that locked the desk controller out and
+made the first move after an idle period a silent no-op (the relay clicked but the desk did
+not move). Do not invert these values without rewiring the desk lines back onto NC.
 
 ## Logging
 

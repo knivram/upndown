@@ -51,8 +51,18 @@ func (d direction) String() string {
 	return "up"
 }
 
-// Relay wiring: channel0/channel1 map to the motor contactors. Both true is the
-// stopped (safe) state. These values must match the physical wiring.
+// Relay wiring: channel0 carries the Up line, channel1 the Down line, each over
+// COM↔NO. Energizing a channel (true) presses that direction's button; both
+// false is the stopped (safe) state. These values must match the physical
+// wiring.
+//
+// Both-false is also the de-energized state the bricklet falls into when it
+// loses power (e.g. the Mac sleeping and dropping USB power). Because stop is now
+// the fail-safe state, a power cycle leaves the desk controller seeing "no button
+// pressed" rather than an invalid both-pressed input — which previously locked
+// the controller out and made the first move after an idle period a no-op (the
+// relay clicked but the desk did not move). Do not invert this without rewiring:
+// the desk lines must sit on the NO terminals for stop=(false,false) to be safe.
 //
 // SetValue on the Industrial Dual Relay is configured response-not-expected in
 // the bindings: it is fire-and-forget, so relayStop never blocks and (barring an
@@ -61,9 +71,9 @@ func (d direction) String() string {
 // guarantee comes from the worker deciding to stop promptly (polling + watchdog),
 // not from confirming the relay. Do not "helpfully" add a retry: there is no ack
 // to retry on, and TCP already delivers the queued command.
-func (c *Client) relayUp() error   { return c.relay.SetValue(false, true) }
-func (c *Client) relayDown() error { return c.relay.SetValue(true, false) }
-func (c *Client) relayStop() error { return c.relay.SetValue(true, true) }
+func (c *Client) relayUp() error   { return c.relay.SetValue(true, false) }
+func (c *Client) relayDown() error { return c.relay.SetValue(false, true) }
+func (c *Client) relayStop() error { return c.relay.SetValue(false, false) }
 
 // forceStop drives the relay to the safe state and logs if the (rare) error path
 // fires. It is the single stop used by every move-ending path.

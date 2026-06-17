@@ -19,7 +19,7 @@ type fakeRelay struct {
 	c1    bool
 	calls int
 	err   error
-	// stopped is signalled every time the relay enters the stop state (true,true);
+	// stopped is signalled every time the relay enters the stop state (false,false);
 	// engaged every time it enters a move state (channels differ).
 	stopped chan struct{}
 	engaged chan struct{}
@@ -38,7 +38,7 @@ func (r *fakeRelay) SetValue(c0, c1 bool) error {
 	r.c0, r.c1 = c0, c1
 	r.calls++
 	switch {
-	case c0 && c1:
+	case !c0 && !c1:
 		select {
 		case r.stopped <- struct{}{}:
 		default:
@@ -167,8 +167,8 @@ func TestStartMoveUp(t *testing.T) {
 	if !c.startMove(1095) {
 		t.Fatal("expected a move to start")
 	}
-	if c0, c1 := c.relay.(*fakeRelay).value(); c0 || !c1 {
-		t.Errorf("relay = (%v,%v), want up (false,true)", c0, c1)
+	if c0, c1 := c.relay.(*fakeRelay).value(); !c0 || c1 {
+		t.Errorf("relay = (%v,%v), want up (true,false)", c0, c1)
 	}
 	if c.moveDir != directionUp || c.moveTarget != 1095 {
 		t.Errorf("move = (%v,%d), want (up,1095)", c.moveDir, c.moveTarget)
@@ -184,8 +184,8 @@ func TestStartMoveDown(t *testing.T) {
 	if !c.startMove(670) {
 		t.Fatal("expected a move to start")
 	}
-	if c0, c1 := c.relay.(*fakeRelay).value(); !c0 || c1 {
-		t.Errorf("relay = (%v,%v), want down (true,false)", c0, c1)
+	if c0, c1 := c.relay.(*fakeRelay).value(); c0 || !c1 {
+		t.Errorf("relay = (%v,%v), want down (false,true)", c0, c1)
 	}
 	if c.moveDir != directionDown {
 		t.Errorf("dir = %v, want down", c.moveDir)
@@ -218,8 +218,8 @@ func TestStartMoveJustOutsideToleranceMoves(t *testing.T) {
 	if !c.startMove(1095) {
 		t.Fatal("expected a move just outside the deadband")
 	}
-	if c0, c1 := c.relay.(*fakeRelay).value(); c0 || !c1 {
-		t.Errorf("relay = (%v,%v), want up (false,true)", c0, c1)
+	if c0, c1 := c.relay.(*fakeRelay).value(); !c0 || c1 {
+		t.Errorf("relay = (%v,%v), want up (true,false)", c0, c1)
 	}
 }
 
@@ -332,8 +332,8 @@ func TestFinishMoveStopsRelay(t *testing.T) {
 
 	c.finishMove(1100)
 
-	if c0, c1 := r.value(); !c0 || !c1 {
-		t.Errorf("relay = (%v,%v), want stopped (true,true)", c0, c1)
+	if c0, c1 := r.value(); c0 || c1 {
+		t.Errorf("relay = (%v,%v), want stopped (false,false)", c0, c1)
 	}
 	if c.moving {
 		t.Error("moving = true, want false")
@@ -354,8 +354,8 @@ func TestAbortMoveLogsDistinctReasons(t *testing.T) {
 
 		slog.SetDefault(prev)
 
-		if c0, c1 := r.value(); !c0 || !c1 {
-			t.Errorf("[%s] relay = (%v,%v), want stopped (true,true)", reason, c0, c1)
+		if c0, c1 := r.value(); c0 || c1 {
+			t.Errorf("[%s] relay = (%v,%v), want stopped (false,false)", reason, c0, c1)
 		}
 		out := buf.String()
 		if !strings.Contains(out, "reason="+reason) {
